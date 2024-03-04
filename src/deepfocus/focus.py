@@ -240,8 +240,11 @@ def FOCUS(
     # 4. Copy source embeddings for overlapping tokens #
     ####################################################
     target_embeddings = torch.zeros((len(target_tokenizer), source_embeddings.shape[1]), device=device)
+    target_embedding_sources = {}
+
     for _, overlapping_token in sorted_overlapping_tokens:
         target_embeddings[overlapping_token.target.id] = overlapping_token.source_embedding
+        target_embedding_sources[overlapping_token.target.id] = {overlapping_token.source[0].id: 1.0}
     logger.success(f"Copied embeddings for {len(overlapping_tokens)} overlapping tokens.")
 
     ###########################################################
@@ -261,16 +264,17 @@ def FOCUS(
     #######################################################
     overlapping_tokens_for_focus = {k: v for k, v in sorted_overlapping_tokens if v.use_for_focus}
     target_embeddings = focus_additional_token_initialization(
-        overlapping_tokens_for_focus, new_tokens, target_embeddings, device=device
+        overlapping_tokens_for_focus, new_tokens, target_embeddings, target_embedding_sources=target_embedding_sources, device=device
     )
     logger.success(f"🎯 Initialized {len(new_tokens)} new tokens with FOCUS 🎯")
-    return target_embeddings.detach()
+    return target_embeddings.detach(), target_embedding_sources
 
 
 def focus_additional_token_initialization(
     overlapping_tokens: dict[str, OverlappingToken],
     new_tokens: dict[str, NewToken],
     target_embeddings: Tensor,
+    target_embedding_sources: dict,
     device: torch.device | str | None = None,
 ):
     # Convert to lists to ensure same order (`.values()` might not guarantee same order every time)
@@ -300,6 +304,8 @@ def focus_additional_token_initialization(
     overlapping_src_embs = [t.source_embedding for t in overlapping_tokens_lst]
     overlapping_src_embs = torch.stack(overlapping_src_embs)
 
+    overlapping_src_indices = torch.tensor([t.source[0].id for t in overlapping_tokens_lst])
+
     for new_token_idx in tqdm(
         range(len(new_tokens_lst)),
         desc="FOCUS initialization...",
@@ -318,4 +324,10 @@ def focus_additional_token_initialization(
 
         new_token_target_vocab_idx = new_tokens_lst[new_token_idx].target.id
         target_embeddings[new_token_target_vocab_idx] = convex_combination
+
+        target_embedding_sources[new_token_target_vocab_idx] = {}
+
+        for source_index, weight in zip(overlapping_src_indices[mask], masked_overlapping_emb_weights):
+            target_embedding_sources[new_token_target_vocab_idx][source_index] = weight
+
     return target_embeddings
