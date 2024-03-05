@@ -1,4 +1,5 @@
-from typing import Literal
+from typing import Literal, Dict
+import logging
 
 import entmax
 import numpy as np
@@ -9,9 +10,9 @@ from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizer
 
 from .fasttext_embs import load_target_token_embedding
-from .logger import logger
 from .vocab_helper import NewToken, OverlappingToken, canonicalize_vocab, construct_vocab_view, is_numerical_symbol_etc
 
+logger = logging.getLogger(__name__)
 
 def get_overlapping_tokens(
     target_tokenizer: PreTrainedTokenizer,
@@ -98,9 +99,9 @@ def FOCUS(
     source_embeddings: Tensor,
     # Auxiliary embedding args
     auxiliary_embedding_mode: Literal["fasttext-tokenlevel", "fasttext-wordlevel"] = "fasttext-tokenlevel",
-    target_training_data_path: str | None = None,
-    fasttext_model_path: str | None = None,
-    language_identifier: str | None = None,
+    target_training_data_path = None,
+    fasttext_model_path = None,
+    language_identifier = None,
     fasttext_model_epochs: int = 3,
     fasttext_model_dim: int = 100,
     fasttext_model_min_count: int = 10,
@@ -108,8 +109,8 @@ def FOCUS(
     exact_match_all: bool = True,
     match_symbols: bool = False,
     fuzzy_match_all: bool = False,
-    extend_tokenizer: PreTrainedTokenizer | None = None,
-    processes: int | None = None,
+    extend_tokenizer = None,
+    processes = None,
     seed: int = 42,
     device="cpu",
     verbosity: Literal["debug", "info", "silent"] = "info",
@@ -140,7 +141,6 @@ def FOCUS(
         Tensor: A tensor of shape `(len(target_tokenizer), embedding_dim)` with the initialized embeddings.
     """
     mode = {"debug": "dev", "info": "package", "silent": "silent"}[verbosity]
-    logger.config(mode=mode)
     logger.info(f"Starting FOCUS initialization for target vocabulary with {len(target_tokenizer)} tokens...")
     ###########################################################
     # 1. Load auxiliary embedding model for target vocabulary #
@@ -199,7 +199,7 @@ def FOCUS(
         leave=False,
     ):
         embs_lst = [source_embeddings[s.id] for s in overlapping_token_info.source]
-        overlapping_tokens[token].source_embedding = embs_lst[0]
+        overlapping_tokens[token].source_embedding = torch.tensor(embs_lst[0])
 
         if len(embs_lst) > 1:
             logger.warning(
@@ -245,7 +245,7 @@ def FOCUS(
     for _, overlapping_token in sorted_overlapping_tokens:
         target_embeddings[overlapping_token.target.id] = overlapping_token.source_embedding
         target_embedding_sources[overlapping_token.target.id] = {overlapping_token.source[0].id: 1.0}
-    logger.success(f"Copied embeddings for {len(overlapping_tokens)} overlapping tokens.")
+    logger.info(f"Copied embeddings for {len(overlapping_tokens)} overlapping tokens.")
 
     ###########################################################
     # 5. Initialize "bad" new tokens from normal distribution #
@@ -266,37 +266,28 @@ def FOCUS(
     target_embeddings = focus_additional_token_initialization(
         overlapping_tokens_for_focus, new_tokens, target_embeddings, target_embedding_sources=target_embedding_sources, device=device
     )
-    logger.success(f"🎯 Initialized {len(new_tokens)} new tokens with FOCUS 🎯")
+    logger.info(f"🎯 Initialized {len(new_tokens)} new tokens with FOCUS 🎯")
     return target_embeddings.detach(), target_embedding_sources
 
 
 def focus_additional_token_initialization(
-    overlapping_tokens: dict[str, OverlappingToken],
-    new_tokens: dict[str, NewToken],
+    overlapping_tokens: Dict[str, OverlappingToken],
+    new_tokens: Dict[str, NewToken],
     target_embeddings: Tensor,
     target_embedding_sources: dict,
-    device: torch.device | str | None = None,
+    device = None,
+    sparsemax_batch_size = 32768
 ):
     # Convert to lists to ensure same order (`.values()` might not guarantee same order every time)
     new_tokens_lst = list(new_tokens.values())
     overlapping_tokens_lst = list(overlapping_tokens.values())
 
     # Convert to numpy arrays for fastdist
-    new_auxiliary_embedding_matrix = np.asarray([t.auxiliary_embedding.tolist() for t in new_tokens_lst], dtype="float32")
-    overlapping_auxiliary_embedding_matrix = np.asarray(
-        [t.auxiliary_embedding.tolist() for t in overlapping_tokens_lst],
+    new_auxiliary_embedding_matrix = np.stack([t.auxiliary_embedding for t in new_tokens_lst], dtype="float32")
+    overlapping_auxiliary_embedding_matrix = np.stack(
+        [t.auxiliary_embedding for t in overlapping_tokens_lst],
         dtype="float32",
     )
-
-    logger.debug("Computing distance matrix...")
-    similarity_matrix = fastdist.cosine_matrix_to_matrix(
-        new_auxiliary_embedding_matrix,
-        overlapping_auxiliary_embedding_matrix,
-    )
-
-    # Not needed anymore, save memory
-    del new_auxiliary_embedding_matrix
-    del overlapping_auxiliary_embedding_matrix
 
     logger.debug("Computing new embeddings...")
 
@@ -305,18 +296,34 @@ def focus_additional_token_initialization(
     overlapping_src_embs = torch.stack(overlapping_src_embs)
 
     overlapping_src_indices = torch.tensor([t.source[0].id for t in overlapping_tokens_lst])
+    
+    logger.debug("Computing distance matrix...")
+    overlap_data = []
+
+    for i in tqdm(range(0, len(new_tokens_lst), sparsemax_batch_size), desc="Sparsemax batch processing..."):
+        batch_similarity_matrix = entmax.sparsemax(torch.from_numpy(fastdist.cosine_matrix_to_matrix(
+            new_auxiliary_embedding_matrix[i : i + sparsemax_batch_size],
+            overlapping_auxiliary_embedding_matrix,
+        )).to(device)).cpu()
+
+        for j in range(batch_similarity_matrix.shape[0]):
+            mask = batch_similarity_matrix[j] > 0.0
+            masked_overlapping_emb_weights = batch_similarity_matrix[j][mask]
+            masked_overlapping_src_embs = overlapping_src_embs[mask]
+
+            overlap_data.append((mask, masked_overlapping_emb_weights, masked_overlapping_src_embs))
+    
+    # Not needed anymore, save memory
+    del new_auxiliary_embedding_matrix
+    del overlapping_auxiliary_embedding_matrix
 
     for new_token_idx in tqdm(
         range(len(new_tokens_lst)),
         desc="FOCUS initialization...",
         total=len(new_tokens_lst),
     ):
-        overlapping_emb_weights: Tensor = entmax.sparsemax(torch.from_numpy(similarity_matrix[new_token_idx]).to(device))
-
         # performance optimization
-        mask = overlapping_emb_weights > 0.0
-        masked_overlapping_emb_weights = overlapping_emb_weights[mask]
-        masked_overlapping_src_embs = overlapping_src_embs[mask]
+        mask, masked_overlapping_emb_weights, masked_overlapping_src_embs = overlap_data[new_token_idx]
 
         weighted_src_embs = torch.mul(masked_overlapping_src_embs, masked_overlapping_emb_weights.unsqueeze(1))
         # It's a convex combination because the weights sum up to 1

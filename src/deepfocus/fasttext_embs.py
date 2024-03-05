@@ -10,7 +10,9 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from .download_utils import download, gunzip
-from .logger import logger
+import logging
+
+logger = logging.getLogger(__name__)
 
 CACHE_DIR = (Path(os.getenv("XDG_CACHE_HOME", "~/.cache")) / "deepfocus").expanduser().resolve()
 
@@ -125,9 +127,9 @@ def download_pretrained_fasttext_word_embs(identifier: str, verbose=True):
 
 def load_target_token_embedding(
     target_tokenizer: PreTrainedTokenizer,
-    target_training_data_path: str | None = None,
-    fasttext_model_path: str | None = None,
-    language_identifier: str | None = None,
+    target_training_data_path = None,
+    fasttext_model_path = None,
+    language_identifier = None,
     epochs: int = None,
     dim: int = None,
     min_count: int = None,
@@ -169,7 +171,7 @@ def load_target_token_embedding(
 
 
 def train_or_load_fasttext_model(
-    text_path: str | None,
+    text_path,
     target_tokenizer: PreTrainedTokenizer,
     epochs,
     dim,

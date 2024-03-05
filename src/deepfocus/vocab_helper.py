@@ -1,5 +1,7 @@
 import string
 from dataclasses import dataclass
+import logging
+from typing import List, Dict
 
 import numpy as np
 import regex
@@ -7,8 +9,7 @@ from torch import Tensor
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
-from .logger import logger
-
+logger = logging.getLogger(__name__)
 
 @dataclass
 class TokenClass:
@@ -25,16 +26,16 @@ class TokenClass:
 @dataclass
 class NewToken:
     target: TokenClass
-    auxiliary_embedding: Tensor | np.ndarray = None
+    auxiliary_embedding: Tensor = None
     descriptor: str = ""
 
 
 @dataclass
 class OverlappingToken:
-    source: list[TokenClass]
+    source: List[TokenClass]
     target: TokenClass
     source_embedding: Tensor = None
-    auxiliary_embedding: Tensor | np.ndarray = None
+    auxiliary_embedding: Tensor = None
     descriptor: str = ""
     use_for_focus: bool = True
 
@@ -117,7 +118,7 @@ def canonicalize_vocab(vocab, tokenizer, descriptor):
     return canonical_vocab
 
 
-def construct_vocab_view(vocab: dict[str, TokenClass], key: str):
+def construct_vocab_view(vocab: Dict[str, TokenClass], key: str):
     view: dict[str, list[TokenClass]] = {}
 
     # sort to ensure deterministic order.
